@@ -356,6 +356,20 @@ void gmx::LegacySimulator::do_md()
     const bool  useGpuForNonbonded = simulationWork.useGpuNonbonded;
     const bool  useGpuForUpdate    = simulationWork.useGpuUpdate;
 
+    if (std::getenv("GMX_FIXED_MOLECULAR_COM") != nullptr)
+    {
+        if (useGpuForUpdate)
+        {
+            gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM requires '-update cpu'.");
+        }
+        if (startingBehavior_ != StartingBehavior::NewSimulation || ir->bContinuation)
+        {
+            gmx_fatal(FARGS,
+                      "GMX_FIXED_MOLECULAR_COM does not yet support checkpoint continuation; "
+                      "its initial COM targets are not checkpointed.");
+        }
+    }
+
     /* Check for polarizable models and flexible constraints */
     gmx_shellfc_t* shellfc = init_shell_flexcon(fpLog_,
                                                 topGlobal_,

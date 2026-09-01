@@ -68,6 +68,7 @@
 #include "gromacs/mdlib/lincs.h"
 #include "gromacs/mdlib/settle.h"
 #include "gromacs/mdlib/shake.h"
+#include "gromacs/mdlib/wholemoleculetransform.h"
 #include "gromacs/mdtypes/inputrec.h"
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/mdtypes/state.h"
@@ -147,6 +148,12 @@ public:
                bool                      computeVirial,
                tensor                    constraintsVirial,
                ConstraintVariable        econq);
+
+    //! Applies the experimental, analytic all-molecule COM position and velocity projection.
+    void applyFixedMolecularComProjection(ArrayRef<const RVec> x,
+                                          ArrayRef<RVec>       xprime,
+                                          ArrayRef<RVec>       v,
+                                          const matrix          box);
     //! The total number of constraints.
     int ncon_tot = 0;
     //! The number of flexible constraints.
@@ -214,6 +221,12 @@ public:
     t_nrnb* nrnb = nullptr;
     //! Tracks wallcycle usage.
     gmx_wallcycle* wcycle;
+
+    //! Experimental fixed molecular COM support, enabled only with GMX_FIXED_MOLECULAR_COM.
+    bool fixedMolecularComEnabled_     = false;
+    bool fixedMolecularComInitialized_ = false;
+    std::unique_ptr<WholeMoleculeTransform> fixedMolecularComWholeMolecules_;
+    std::vector<RVec> fixedMolecularComTargets_;
 };
 
 Constraints::~Constraints() = default;
@@ -769,6 +782,11 @@ bool Constraints::Impl::apply(const bool                computeRmsd,
 
     if (econq == ConstraintVariable::Positions)
     {
+        if (fixedMolecularComEnabled_)
+        {
+            applyFixedMolecularComProjection(
+                    x.unpaddedArrayRef(), xprime.unpaddedArrayRef(), v.unpaddedArrayRef(), box);
+        }
         if (ir.bPull && pull_have_constraint(*pullWork_))
         {
             if (EI_DYNAMICS(ir.eI))
@@ -1137,6 +1155,40 @@ Constraints::Impl::Impl(const gmx_mtop_t&          mtop_p,
     nrnb(nrnb_p),
     wcycle(wcycle_p)
 {
+    fixedMolecularComEnabled_ = (std::getenv("GMX_FIXED_MOLECULAR_COM") != nullptr);
+    if (fixedMolecularComEnabled_)
+    {
+        if (mpiComm.isParallel() || dd != nullptr)
+        {
+            gmx_fatal(FARGS,
+                      "GMX_FIXED_MOLECULAR_COM supports exactly one PP rank without domain decomposition.");
+        }
+        if (ir.eI != IntegrationAlgorithm::MD || ir.pressureCouplingOptions.epc != PressureCoupling::No
+            || ir.pbcType != PbcType::Xyz || ir.efep != FreeEnergyPerturbationType::No)
+        {
+            gmx_fatal(FARGS,
+                      "GMX_FIXED_MOLECULAR_COM supports only md, NVT, xyz PBC, and no free-energy perturbation.");
+        }
+        if (ir.bPull && pullWork_ != nullptr && pull_have_constraint(*pullWork_))
+        {
+            gmx_fatal(FARGS,
+                      "GMX_FIXED_MOLECULAR_COM cannot be combined with generic pull constraints.");
+        }
+
+        fixedMolecularComWholeMolecules_ = std::make_unique<WholeMoleculeTransform>(mtop, ir.pbcType, false);
+        int numMolecules = 0;
+        for (const auto& moleculeBlock : mtop.molblock)
+        {
+            numMolecules += moleculeBlock.nmol;
+        }
+        fixedMolecularComTargets_.resize(numMolecules);
+        if (log != nullptr)
+        {
+            fprintf(log,
+                    "Experimental fixed molecular COM projection enabled with GMX_FIXED_MOLECULAR_COM.\n");
+        }
+    }
+
     if (numConstraints + numSettles > 0 && ir.pressureCouplingOptions.epc == PressureCoupling::Mttk)
     {
         gmx_fatal(FARGS, "Constraints are not implemented with MTTK pressure control.");
@@ -1262,6 +1314,110 @@ Constraints::Impl::Impl(const gmx_mtop_t&          mtop_p,
     }
     warncount_lincs  = 0;
     warncount_settle = 0;
+}
+
+void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RVec> x,
+                                                          const ArrayRef<RVec>       xprime,
+                                                          const ArrayRef<RVec>       v,
+                                                          const matrix                box)
+{
+    GMX_RELEASE_ASSERT(numHomeAtoms_ == mtop.natoms,
+                       "GMX_FIXED_MOLECULAR_COM requires all atoms to be local.");
+    GMX_RELEASE_ASSERT(!v.empty(), "GMX_FIXED_MOLECULAR_COM requires propagated velocities.");
+
+    for (int i = 0; i < DIM; ++i)
+    {
+        for (int j = 0; j < DIM; ++j)
+        {
+            if (i != j && box[i][j] != 0)
+            {
+                gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM supports orthorhombic boxes only.");
+            }
+        }
+    }
+
+    fixedMolecularComWholeMolecules_->updateForAtomPbcJumps(x, box);
+    const ArrayRef<const RVec> wholeOld = fixedMolecularComWholeMolecules_->wholeMoleculeCoordinates(x, box);
+    // WholeMoleculeTransform owns one reusable buffer. Preserve initial whole coordinates before
+    // reusing it for xprime; this allocation happens once only, at the first projection.
+    std::vector<RVec> initialWholeCoordinates;
+    if (!fixedMolecularComInitialized_)
+    {
+        initialWholeCoordinates.assign(wholeOld.begin(), wholeOld.end());
+    }
+    fixedMolecularComWholeMolecules_->updateForAtomPbcJumps(xprime, box);
+    const ArrayRef<const RVec> wholeNew = fixedMolecularComWholeMolecules_->wholeMoleculeCoordinates(xprime, box);
+
+    t_pbc pbc;
+    set_pbc(&pbc, ir.pbcType, box);
+
+    int moleculeBlockIndex = 0;
+    for (const auto& moleculeBlock : mtop.molblock)
+    {
+        const MoleculeBlockIndices& blockIndices = mtop.moleculeBlockIndices[moleculeBlockIndex];
+        const int atomsPerMolecule = blockIndices.numAtomsPerMolecule;
+        int atomStart              = blockIndices.globalAtomStart;
+        int moleculeIndex          = blockIndices.moleculeIndexStart;
+
+        for (int molecule = 0; molecule < moleculeBlock.nmol; ++molecule)
+        {
+            RVec oldCom   = { 0, 0, 0 };
+            RVec newCom   = { 0, 0, 0 };
+            real totalMass = 0;
+            for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
+            {
+                const int atom = atomStart + atomOffset;
+                const real mass = masses_[atom];
+                if (mass > 0)
+                {
+                    for (int d = 0; d < DIM; ++d)
+                    {
+                        if (!fixedMolecularComInitialized_)
+                        {
+                            oldCom[d] += mass * initialWholeCoordinates[atom][d];
+                        }
+                        newCom[d] += mass * wholeNew[atom][d];
+                    }
+                    totalMass += mass;
+                }
+            }
+            if (totalMass <= 0)
+            {
+                gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM encountered a massless molecule.");
+            }
+            for (int d = 0; d < DIM; ++d)
+            {
+                oldCom[d] /= totalMass;
+                newCom[d] /= totalMass;
+            }
+
+            if (!fixedMolecularComInitialized_)
+            {
+                fixedMolecularComTargets_[moleculeIndex] = oldCom;
+            }
+
+            RVec displacement;
+            pbc_dx(&pbc, newCom, fixedMolecularComTargets_[moleculeIndex], displacement);
+            for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
+            {
+                const int atom = atomStart + atomOffset;
+                for (int d = 0; d < DIM; ++d)
+                {
+                    // Translate every site, including massless virtual sites, by the same amount.
+                    xprime[atom][d] -= displacement[d];
+                    // Only propagated massive particles receive a velocity correction.
+                    if (masses_[atom] > 0)
+                    {
+                        v[atom][d] -= displacement[d] / ir.delta_t;
+                    }
+                }
+            }
+            atomStart += atomsPerMolecule;
+            ++moleculeIndex;
+        }
+        ++moleculeBlockIndex;
+    }
+    fixedMolecularComInitialized_ = true;
 }
 
 Constraints::Impl::~Impl()
