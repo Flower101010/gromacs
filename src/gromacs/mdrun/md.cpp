@@ -362,7 +362,7 @@ void gmx::LegacySimulator::do_md()
         {
             gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM requires '-update cpu'.");
         }
-        if (startingBehavior_ != StartingBehavior::NewSimulation || ir->bContinuation)
+        if (startingBehavior_ != StartingBehavior::NewSimulation)
         {
             gmx_fatal(FARGS,
                       "GMX_FIXED_MOLECULAR_COM does not yet support checkpoint continuation; "
