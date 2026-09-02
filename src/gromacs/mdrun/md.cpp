@@ -41,6 +41,7 @@
 #include "gmxpre.h"
 
 #include <cinttypes>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -183,6 +185,83 @@ struct gmx_shellfc_t;
 struct pme_load_balancing_t;
 
 using gmx::SimulationSignaller;
+
+namespace
+{
+
+/*! \brief Streams topology-order molecular force sums for fixed-COM RMF runs.
+ *
+ * The file is deliberately a small append-only binary protocol so a local
+ * convergence watcher can consume complete records while mdrun is running.
+ * It is enabled only when both experimental fixed molecular COM projection and
+ * GMX_FIXED_MOLECULAR_COM_FORCE_FILE are requested. Atom forces are summed
+ * over every site in a molecule, including virtual sites, matching the
+ * generalized force used by the molecular-COM mapping.
+ */
+class FixedMolecularComForceWriter
+{
+public:
+    FixedMolecularComForceWriter(const char* path, const gmx_mtop_t& topology) : topology_(topology)
+    {
+        for (const auto& block : topology_.molblock)
+        {
+            moleculeCount_ += block.nmol;
+        }
+        stream_.open(path, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!stream_)
+        {
+            gmx_fatal(FARGS, "Could not open GMX_FIXED_MOLECULAR_COM_FORCE_FILE for writing.");
+        }
+        constexpr char     magic[8] = { 'G', 'M', 'X', 'C', 'O', 'M', 'F', '1' };
+        constexpr uint32_t version  = 1;
+        const uint64_t     count    = moleculeCount_;
+        stream_.write(magic, sizeof(magic));
+        stream_.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        stream_.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        stream_.flush();
+    }
+
+    void write(double time, gmx::ArrayRef<const gmx::RVec> forces)
+    {
+        GMX_RELEASE_ASSERT(forces.ssize() == topology_.natoms,
+                           "Molecular-COM force output requires all atom forces on one rank.");
+        values_.assign(3 * moleculeCount_, 0.0F);
+        size_t moleculeIndex = 0;
+        for (size_t blockIndex = 0; blockIndex < topology_.molblock.size(); ++blockIndex)
+        {
+            const auto& block       = topology_.molblock[blockIndex];
+            const auto& indices     = topology_.moleculeBlockIndices[blockIndex];
+            for (int molecule = 0; molecule < block.nmol; ++molecule, ++moleculeIndex)
+            {
+                const int atomStart = indices.globalAtomStart + molecule * indices.numAtomsPerMolecule;
+                for (int atomOffset = 0; atomOffset < indices.numAtomsPerMolecule; ++atomOffset)
+                {
+                    const auto& force = forces[atomStart + atomOffset];
+                    for (int dimension = 0; dimension < DIM; ++dimension)
+                    {
+                        values_[DIM * moleculeIndex + dimension] += force[dimension];
+                    }
+                }
+            }
+        }
+        stream_.write(reinterpret_cast<const char*>(&time), sizeof(time));
+        stream_.write(reinterpret_cast<const char*>(values_.data()),
+                      static_cast<std::streamsize>(values_.size() * sizeof(values_.front())));
+        stream_.flush();
+        if (!stream_)
+        {
+            gmx_fatal(FARGS, "Could not write GMX_FIXED_MOLECULAR_COM_FORCE_FILE.");
+        }
+    }
+
+private:
+    const gmx_mtop_t&  topology_;
+    uint64_t           moleculeCount_ = 0;
+    std::ofstream      stream_;
+    std::vector<float> values_;
+};
+
+} // namespace
 
 void gmx::LegacySimulator::do_md()
 {
@@ -367,6 +446,15 @@ void gmx::LegacySimulator::do_md()
             gmx_fatal(FARGS,
                       "GMX_FIXED_MOLECULAR_COM does not yet support checkpoint continuation; "
                       "its initial COM targets are not checkpointed.");
+        }
+    }
+
+    std::optional<FixedMolecularComForceWriter> fixedMolecularComForceWriter;
+    if (std::getenv("GMX_FIXED_MOLECULAR_COM") != nullptr && isMainRank)
+    {
+        if (const char* forceFile = std::getenv("GMX_FIXED_MOLECULAR_COM_FORCE_FILE"))
+        {
+            fixedMolecularComForceWriter.emplace(forceFile, topGlobal_);
         }
     }
 
@@ -1439,6 +1527,10 @@ void gmx::LegacySimulator::do_md()
                                      bLastStep,
                                      mdrunOptions_.writeConfout,
                                      ekindataState);
+            if (fixedMolecularComForceWriter && do_per_step(step, ir->nstfout))
+            {
+                fixedMolecularComForceWriter->write(t, f.view().force());
+            }
             /* Check if IMD step and do IMD communication, if bIMD is TRUE. */
             bInteractiveMDstep = imdSession_->run(step, bNS, state_->box, state_->x, t);
 
