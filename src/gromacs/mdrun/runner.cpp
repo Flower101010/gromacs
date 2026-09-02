@@ -1069,6 +1069,7 @@ int Mdrunner::mdrunner()
                       partialDeserializedTpr.get());
     }
     GMX_RELEASE_ASSERT(inputrec != nullptr, "All ranks should have a valid inputrec now");
+    adjustDegreesOfFreedomForFixedMolecularCom(mtop, inputrec.get());
     partialDeserializedTpr.reset(nullptr);
 
     // Note that these variables describe only their own node.
@@ -2223,8 +2224,6 @@ int Mdrunner::mdrunner()
          */
         signal_handler_install();
     }
-
-    adjustDegreesOfFreedomForFixedMolecularCom(mtop, inputrec.get());
 
     try
     {
