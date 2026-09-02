@@ -368,6 +368,70 @@ static DevelopmentFeatureFlags manageDevelopmentFeatures(const gmx::MDLogger& md
     return devFlags;
 }
 
+/*! \brief Account for the three translational constraints imposed on every molecule by the
+ * experimental fixed molecular COM projection.
+ *
+ * This must run before kinetic-energy, energy-output, and thermostat objects are created.
+ * The first prototype only permits a molecule's massive atoms to belong to one temperature
+ * coupling group, so its three removed degrees of freedom have an unambiguous destination.
+ */
+static void adjustDegreesOfFreedomForFixedMolecularCom(const gmx_mtop_t& mtop, t_inputrec* inputrec)
+{
+    if (std::getenv("GMX_FIXED_MOLECULAR_COM") == nullptr)
+    {
+        return;
+    }
+    if (inputrec->opts.ngtc == 0 || inputrec->opts.nrdf == nullptr)
+    {
+        gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM requires temperature coupling.");
+    }
+
+    std::vector<int> constrainedMoleculesPerTemperatureGroup(inputrec->opts.ngtc, 0);
+    for (size_t moleculeBlockIndex = 0; moleculeBlockIndex < mtop.molblock.size(); ++moleculeBlockIndex)
+    {
+        const auto&                 moleculeBlock = mtop.molblock[moleculeBlockIndex];
+        const MoleculeBlockIndices& blockIndices = mtop.moleculeBlockIndices[moleculeBlockIndex];
+        const gmx_moltype_t&        moleculeType = mtop.moltype[moleculeBlock.type];
+        for (int molecule = 0; molecule < moleculeBlock.nmol; ++molecule)
+        {
+            const int atomStart = blockIndices.globalAtomStart + molecule * blockIndices.numAtomsPerMolecule;
+            int       temperatureGroup = -1;
+            for (int atomOffset = 0; atomOffset < blockIndices.numAtomsPerMolecule; ++atomOffset)
+            {
+                if (moleculeType.atoms.atom[atomOffset].m <= 0)
+                {
+                    continue;
+                }
+                const int atomTemperatureGroup =
+                        getGroupType(mtop.groups, SimulationAtomGroupType::TemperatureCoupling, atomStart + atomOffset);
+                if (temperatureGroup >= 0 && temperatureGroup != atomTemperatureGroup)
+                {
+                    gmx_fatal(FARGS,
+                              "GMX_FIXED_MOLECULAR_COM requires every molecule's massive atoms to "
+                              "belong to one temperature-coupling group.");
+                }
+                temperatureGroup = atomTemperatureGroup;
+            }
+            if (temperatureGroup < 0)
+            {
+                gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM encountered a massless molecule.");
+            }
+            ++constrainedMoleculesPerTemperatureGroup[temperatureGroup];
+        }
+    }
+
+    for (int temperatureGroup = 0; temperatureGroup < inputrec->opts.ngtc; ++temperatureGroup)
+    {
+        const real degreesOfFreedomToRemove = 3 * constrainedMoleculesPerTemperatureGroup[temperatureGroup];
+        if (inputrec->opts.nrdf[temperatureGroup] < degreesOfFreedomToRemove)
+        {
+            gmx_fatal(FARGS,
+                      "GMX_FIXED_MOLECULAR_COM would make the temperature-coupling degrees of freedom negative.");
+        }
+        inputrec->opts.nrdf[temperatureGroup] -= degreesOfFreedomToRemove;
+    }
+}
+
 /*! \brief Barrier for safe simultaneous thread access to mdrunner data
  *
  * Used to ensure that the main thread does not modify mdrunner during copy
@@ -2159,6 +2223,8 @@ int Mdrunner::mdrunner()
          */
         signal_handler_install();
     }
+
+    adjustDegreesOfFreedomForFixedMolecularCom(mtop, inputrec.get());
 
     try
     {
