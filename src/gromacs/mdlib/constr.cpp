@@ -68,7 +68,6 @@
 #include "gromacs/mdlib/lincs.h"
 #include "gromacs/mdlib/settle.h"
 #include "gromacs/mdlib/shake.h"
-#include "gromacs/mdlib/wholemoleculetransform.h"
 #include "gromacs/mdtypes/inputrec.h"
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/mdtypes/state.h"
@@ -225,7 +224,6 @@ public:
     //! Experimental fixed molecular COM support, enabled only with GMX_FIXED_MOLECULAR_COM.
     bool fixedMolecularComEnabled_     = false;
     bool fixedMolecularComInitialized_ = false;
-    std::unique_ptr<WholeMoleculeTransform> fixedMolecularComWholeMolecules_;
     std::vector<RVec> fixedMolecularComTargets_;
 };
 
@@ -1175,7 +1173,6 @@ Constraints::Impl::Impl(const gmx_mtop_t&          mtop_p,
                       "GMX_FIXED_MOLECULAR_COM cannot be combined with generic pull constraints.");
         }
 
-        fixedMolecularComWholeMolecules_ = std::make_unique<WholeMoleculeTransform>(mtop, ir.pbcType, false);
         int numMolecules = 0;
         for (const auto& moleculeBlock : mtop.molblock)
         {
@@ -1336,18 +1333,6 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
         }
     }
 
-    fixedMolecularComWholeMolecules_->updateForAtomPbcJumps(x, box);
-    const ArrayRef<const RVec> wholeOld = fixedMolecularComWholeMolecules_->wholeMoleculeCoordinates(x, box);
-    // WholeMoleculeTransform owns one reusable buffer. Preserve initial whole coordinates before
-    // reusing it for xprime; this allocation happens once only, at the first projection.
-    std::vector<RVec> initialWholeCoordinates;
-    if (!fixedMolecularComInitialized_)
-    {
-        initialWholeCoordinates.assign(wholeOld.begin(), wholeOld.end());
-    }
-    fixedMolecularComWholeMolecules_->updateForAtomPbcJumps(xprime, box);
-    const ArrayRef<const RVec> wholeNew = fixedMolecularComWholeMolecules_->wholeMoleculeCoordinates(xprime, box);
-
     t_pbc pbc;
     set_pbc(&pbc, ir.pbcType, box);
 
@@ -1361,8 +1346,26 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
 
         for (int molecule = 0; molecule < moleculeBlock.nmol; ++molecule)
         {
-            RVec oldCom   = { 0, 0, 0 };
-            RVec newCom   = { 0, 0, 0 };
+            // This prototype supports only small molecules.  Reconstruct each molecule around
+            // one massive site with the standard minimum-image PBC primitive, instead of the
+            // global WholeMoleculeTransform used for arbitrary bonded systems.
+            int referenceAtom = -1;
+            for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
+            {
+                const int atom = atomStart + atomOffset;
+                if (masses_[atom] > 0)
+                {
+                    referenceAtom = atom;
+                    break;
+                }
+            }
+            if (referenceAtom < 0)
+            {
+                gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM encountered a massless molecule.");
+            }
+
+            RVec oldCom = { 0, 0, 0 };
+            RVec newCom = { 0, 0, 0 };
             real totalMass = 0;
             for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
             {
@@ -1370,20 +1373,23 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
                 const real mass = masses_[atom];
                 if (mass > 0)
                 {
+                    RVec newRelative;
+                    pbc_dx(&pbc, xprime[atom], xprime[referenceAtom], newRelative);
+                    RVec oldRelative;
+                    if (!fixedMolecularComInitialized_)
+                    {
+                        pbc_dx(&pbc, x[atom], x[referenceAtom], oldRelative);
+                    }
                     for (int d = 0; d < DIM; ++d)
                     {
                         if (!fixedMolecularComInitialized_)
                         {
-                            oldCom[d] += mass * initialWholeCoordinates[atom][d];
+                            oldCom[d] += mass * (x[referenceAtom][d] + oldRelative[d]);
                         }
-                        newCom[d] += mass * wholeNew[atom][d];
+                        newCom[d] += mass * (xprime[referenceAtom][d] + newRelative[d]);
                     }
                     totalMass += mass;
                 }
-            }
-            if (totalMass <= 0)
-            {
-                gmx_fatal(FARGS, "GMX_FIXED_MOLECULAR_COM encountered a massless molecule.");
             }
             for (int d = 0; d < DIM; ++d)
             {
