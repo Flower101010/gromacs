@@ -1333,22 +1333,22 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
         }
     }
 
-    t_pbc pbc;
-    set_pbc(&pbc, ir.pbcType, box);
-
     int moleculeBlockIndex = 0;
+    const int gmx_unused numThreads = gmx_omp_nthreads_get(ModuleMultiThread::Update);
     for (const auto& moleculeBlock : mtop.molblock)
     {
         const MoleculeBlockIndices& blockIndices = mtop.moleculeBlockIndices[moleculeBlockIndex];
         const int atomsPerMolecule = blockIndices.numAtomsPerMolecule;
-        int atomStart              = blockIndices.globalAtomStart;
-        int moleculeIndex          = blockIndices.moleculeIndexStart;
+        const int globalAtomStart  = blockIndices.globalAtomStart;
 
+#pragma omp parallel for num_threads(numThreads) schedule(static)
         for (int molecule = 0; molecule < moleculeBlock.nmol; ++molecule)
         {
-            // This prototype supports only small molecules.  Reconstruct each molecule around
-            // one massive site with the standard minimum-image PBC primitive, instead of the
-            // global WholeMoleculeTransform used for arbitrary bonded systems.
+            const int atomStart = globalAtomStart + molecule * atomsPerMolecule;
+            const int moleculeIndex = blockIndices.moleculeIndexStart + molecule;
+            // This prototype supports only small molecules. Reconstruct each molecule around
+            // one massive site using the rectangular minimum-image rule in pbc_dx(). This is
+            // intentionally local; arbitrary bonded systems require WholeMoleculeTransform.
             int referenceAtom = -1;
             for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
             {
@@ -1374,11 +1374,16 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
                 if (mass > 0)
                 {
                     RVec newRelative;
-                    pbc_dx(&pbc, xprime[atom], xprime[referenceAtom], newRelative);
                     RVec oldRelative;
-                    if (!fixedMolecularComInitialized_)
+                    for (int d = 0; d < DIM; ++d)
                     {
-                        pbc_dx(&pbc, x[atom], x[referenceAtom], oldRelative);
+                        newRelative[d] = xprime[atom][d] - xprime[referenceAtom][d];
+                        newRelative[d] -= box[d][d] * std::floor(newRelative[d] / box[d][d] + real(0.5));
+                        if (!fixedMolecularComInitialized_)
+                        {
+                            oldRelative[d] = x[atom][d] - x[referenceAtom][d];
+                            oldRelative[d] -= box[d][d] * std::floor(oldRelative[d] / box[d][d] + real(0.5));
+                        }
                     }
                     for (int d = 0; d < DIM; ++d)
                     {
@@ -1403,7 +1408,11 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
             }
 
             RVec displacement;
-            pbc_dx(&pbc, newCom, fixedMolecularComTargets_[moleculeIndex], displacement);
+            for (int d = 0; d < DIM; ++d)
+            {
+                displacement[d] = newCom[d] - fixedMolecularComTargets_[moleculeIndex][d];
+                displacement[d] -= box[d][d] * std::floor(displacement[d] / box[d][d] + real(0.5));
+            }
             for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
             {
                 const int atom = atomStart + atomOffset;
@@ -1418,8 +1427,6 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
                     }
                 }
             }
-            atomStart += atomsPerMolecule;
-            ++moleculeIndex;
         }
         ++moleculeBlockIndex;
     }
