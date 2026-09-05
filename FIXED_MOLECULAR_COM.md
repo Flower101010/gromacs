@@ -25,6 +25,53 @@ translated with their parent molecule. Thus the TIP4P M site is handled
 correctly. A uniform translation preserves intramolecular distances and
 orientation; the molecule remains free to rotate.
 
+## Leap-frog initialization and time labels
+
+`integrator=md` stores positions at `t_n` and velocities at `t_n-dt/2`.
+The update produces `v_(n+1/2)` and then `x_(n+1) = x_n + dt*v_(n+1/2)`.
+The COM correction therefore remains `-dR/dt`, not `-dR/(dt/2)`.
+At trajectory time `t_n`, the force stream corresponds to `x_n`; the stored
+velocity belongs to the preceding half step. The reported leap-frog kinetic
+energy averages adjacent half-step kinetic energies, so it need not equal
+the kinetic energy calculated from that frame's velocity alone.
+
+For a fresh run, targets are captured before initial internal-constraint
+corrections, and the initial mass-weighted molecular translational velocity
+is removed before kinetic-energy history and thermostat initialization.
+Both `continuation=yes` and `continuation=no` MDP settings are supported for
+fresh runs; this does not enable checkpoint restart. With `continuation=no`,
+the position-only constraint call and reverse initialization at `t0-dt`
+are handled explicitly. A final initial velocity projection removes the
+roundoff residue from that reverse step without changing the saved targets.
+With `continuation=yes`, GROMACS still trusts the supplied internal geometry
+and velocities; the new molecular COM constraints are initialized regardless.
+
+The local regression can be repeated on the RTX 3060 with:
+
+```bash
+python3 admin/validate-fixed-com-initialization.py \
+    --gmx /home/flos/gromacs-fixed-com-build/bin/gmx_mpi \
+    --gro /home/flos/MeOH-H2O/systems/cluster_grid/xm_050/production.gro \
+    --top /home/flos/CGWorkflow/benchmarks/pull-constraint-20260901/inputs/topol.local.top \
+    --output /tmp/fixed-com-startup-test
+```
+
+Choose a new output directory. The script runs both continuation settings
+with the feature on and off, reads high-precision TRR dumps, and checks COM
+positions, half-step COM velocities, the discrete position/velocity relation,
+rigid distances, initial kinetic energy and runtime Ndf. Fixture masses and
+atom order are specific to the 500 SOL + 500 MEOH system above.
+
+On 2026-09-05, the 20-step tests passed with initial maximum COM velocities
+below `4e-8 nm/ps`, maximum COM position errors below `7.5e-7 nm`, and maximum
+rigid-distance errors below `4.6e-7 nm`. Initial kinetic energy for
+`continuation=yes` was `3697.078920 kJ/mol`, matching the independent value
+`7531.697010 - 3834.618088 = 3697.078921 kJ/mol` after removing translation.
+During integration, maximum COM velocity residue was `3.87e-4 nm/ps` and the
+maximum discrete velocity/position discrepancy was `3.93e-4 nm/ps`, consistent
+with single-precision coordinate roundoff divided by `dt=0.002 ps`. These
+are finite-precision tolerances, not exact zeros or long-run ensemble tests.
+
 ## Running
 
 Use a fresh run from the target configuration and enable the experimental
