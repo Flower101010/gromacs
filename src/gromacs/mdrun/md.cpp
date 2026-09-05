@@ -662,6 +662,14 @@ void gmx::LegacySimulator::do_md()
                 cr_->dd, mdLog_, *ir, state_->box, *fr_->ic, *fr_->nbv, fr_->pmedata, simulationWork);
     }
 
+    // Targets belong to the input configuration, before any initial internal-constraint
+    // correction. Remove COM translation before computing either half-step kinetic energy.
+    // Checkpoint restarts with this feature have already been rejected above.
+    if (constr_)
+    {
+        constr_->initializeFixedMolecularCom(makeArrayRef(state_->x), makeArrayRef(state_->v), state_->box);
+    }
+
     if (!ir->bContinuation)
     {
         if (state_->hasEntry(StateEntry::V))
@@ -698,6 +706,10 @@ void gmx::LegacySimulator::do_md()
                                state_->v.arrayRefWithPadding(),
                                state_->box,
                                state_->lambda[FreeEnergyPerturbationCouplingType::Bonded]);
+            // Position roundoff divided by dt in the reverse initialization can leave a
+            // small translational velocity. Remove it before initializing kinetic energy.
+            constr_->removeInitialFixedMolecularComVelocity(
+                    makeArrayRef(state_->x), makeArrayRef(state_->v), state_->box);
         }
     }
 

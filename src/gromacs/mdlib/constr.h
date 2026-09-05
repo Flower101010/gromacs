@@ -130,6 +130,13 @@ public:
     /*! \brief Returns whether the system contains perturbed constraints */
     bool havePerturbedConstraints() const;
 
+    //! Initialize fixed-COM targets and remove initial COM velocity before kinetic-energy setup.
+    //! A no-op when the experimental feature is disabled.
+    void initializeFixedMolecularCom(ArrayRef<RVec> x, ArrayRef<RVec> v, const matrix box);
+
+    //! Remove residual COM velocity after initial internal constraints; keep the original targets.
+    void removeInitialFixedMolecularComVelocity(ArrayRef<RVec> x, ArrayRef<RVec> v, const matrix box);
+
     /*! \brief Set up all the local constraints for the domain.
      *
      * \todo Make this a callback that is called automatically

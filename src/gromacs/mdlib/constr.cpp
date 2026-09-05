@@ -152,7 +152,8 @@ public:
     void applyFixedMolecularComProjection(ArrayRef<const RVec> x,
                                           ArrayRef<RVec>       xprime,
                                           ArrayRef<RVec>       v,
-                                          const matrix          box);
+                                          const matrix          box,
+                                          bool                  initialize = false);
     //! The total number of constraints.
     int ncon_tot = 0;
     //! The number of flexible constraints.
@@ -228,6 +229,26 @@ public:
 };
 
 Constraints::~Constraints() = default;
+
+void Constraints::initializeFixedMolecularCom(ArrayRef<RVec> x, ArrayRef<RVec> v, const matrix box)
+{
+    if (impl_->fixedMolecularComEnabled_)
+    {
+        GMX_RELEASE_ASSERT(!impl_->fixedMolecularComInitialized_, "Fixed COM targets must be initialized once");
+        impl_->applyFixedMolecularComProjection(x, x, v, box, true);
+    }
+}
+
+void Constraints::removeInitialFixedMolecularComVelocity(ArrayRef<RVec> x, ArrayRef<RVec> v, const matrix box)
+{
+    if (impl_->fixedMolecularComEnabled_)
+    {
+        GMX_RELEASE_ASSERT(impl_->fixedMolecularComInitialized_, "Fixed COM targets must already exist");
+        // Initialization mode leaves coordinates untouched and removes mass-weighted velocity.
+        // Since targets are already initialized, they are not captured a second time.
+        impl_->applyFixedMolecularComProjection(x, x, v, box, true);
+    }
+}
 
 int Constraints::numFlexibleConstraints() const
 {
@@ -1316,11 +1337,13 @@ Constraints::Impl::Impl(const gmx_mtop_t&          mtop_p,
 void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RVec> x,
                                                           const ArrayRef<RVec>       xprime,
                                                           const ArrayRef<RVec>       v,
-                                                          const matrix                box)
+                                                          const matrix                box,
+                                                          const bool                  initialize)
 {
     GMX_RELEASE_ASSERT(numHomeAtoms_ == mtop.natoms,
                        "GMX_FIXED_MOLECULAR_COM requires all atoms to be local.");
-    GMX_RELEASE_ASSERT(!v.empty(), "GMX_FIXED_MOLECULAR_COM requires propagated velocities.");
+    GMX_RELEASE_ASSERT(initialize || fixedMolecularComInitialized_, "Fixed COM targets must exist before constraining");
+    GMX_RELEASE_ASSERT(!initialize || !v.empty(), "Fixed COM initialization requires velocities");
 
     for (int i = 0; i < DIM; ++i)
     {
@@ -1367,12 +1390,20 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
             RVec oldCom = { 0, 0, 0 };
             RVec newCom = { 0, 0, 0 };
             real totalMass = 0;
+            double momentum[DIM] = { 0, 0, 0 };
             for (int atomOffset = 0; atomOffset < atomsPerMolecule; ++atomOffset)
             {
                 const int atom = atomStart + atomOffset;
                 const real mass = masses_[atom];
                 if (mass > 0)
                 {
+                    if (initialize)
+                    {
+                        for (int d = 0; d < DIM; ++d)
+                        {
+                            momentum[d] += double(mass) * v[atom][d];
+                        }
+                    }
                     RVec newRelative;
                     RVec oldRelative;
                     for (int d = 0; d < DIM; ++d)
@@ -1419,11 +1450,18 @@ void Constraints::Impl::applyFixedMolecularComProjection(const ArrayRef<const RV
                 for (int d = 0; d < DIM; ++d)
                 {
                     // Translate every site, including massless virtual sites, by the same amount.
-                    xprime[atom][d] -= displacement[d];
-                    // Only propagated massive particles receive a velocity correction.
-                    if (masses_[atom] > 0)
+                    if (!initialize)
                     {
-                        v[atom][d] -= displacement[d] / ir.delta_t;
+                        xprime[atom][d] -= displacement[d];
+                    }
+                    // Only propagated massive particles receive a velocity correction.
+                    if (masses_[atom] > 0 && !v.empty())
+                    {
+                        // Leap-frog propagates half-step velocities over a full dt. The
+                        // reverse initialization step passes reversed velocities, so the
+                        // same correction applies there. Position-only calls pass no v.
+                        v[atom][d] -= initialize ? momentum[d] / totalMass
+                                                : displacement[d] / ir.delta_t;
                     }
                 }
             }
