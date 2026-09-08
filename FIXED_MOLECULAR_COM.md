@@ -89,6 +89,86 @@ coupling degrees of freedom. For the 500 water + 500 methanol benchmark,
 are removed for each of 1000 molecular COM constraints. This correction is
 required for the reported temperature and for v-rescale sampling.
 
+## Online force and virial averages (local build)
+
+Enable a final small text file without storing instantaneous trajectories:
+
+```bash
+export GMX_FIXED_MOLECULAR_COM=1
+export GMX_FIXED_MOLECULAR_COM_AVERAGE_FILE="$PWD/rmf-average.txt"
+export GMX_FIXED_MOLECULAR_COM_AVERAGE_SKIP_STEPS=5000
+export GMX_FIXED_MOLECULAR_COM_AVERAGE_STRIDE=10
+unset GMX_FIXED_MOLECULAR_COM_FORCE_FILE
+gmx_mpi mdrun -s input.tpr -deffnm fixed-com \
+    -ntomp 8 -update cpu -nb gpu -pme gpu
+```
+
+The average switch defaults to off. Skip defaults to 0 and stride to 1.
+Both are integer MD steps: sample when `s >= skip` and
+`(s - skip) % stride == 0`, where `s = step - init_step`.
+Thus skip=5000 at dt=0.002 ps excludes the first 10 ps and includes the
+configuration at 10 ps. The initial and final configurations are included
+if they meet this rule; nsteps=N can give N+1 samples with default settings.
+This schedule is independent of `nstfout`, `nstenergy`, and `nstcalcenergy`.
+Set `nstfout=0`, `nstxout=0`, `nstvout=0`, and `nstxout-compressed=0` in the
+TPR to avoid large trajectories. Normal small GROMACS energy/log output
+can remain enabled.
+
+The force estimator is exactly the existing molecular force stream estimator:
+the same float per-molecule summation over all sites, followed by double
+accumulation across samples. Force rows use 1-based topology molecule order
+and units kJ mol^-1 nm^-1. No constraint-force estimator is changed.
+
+Virial rows are the nine components of `force_vir` from `do_force()` at the
+same configuration as the forces, before integration. This is the physical
+force virial, including PME, virtual-site handling and configured dispersion
+correction, in GROMACS Xi convention (the usual -1/2 force-position convention),
+units kJ mol^-1. It is **not** the later `total_vir = force_vir + shake_vir`,
+does not include kinetic stress or internal SETTLE/LINCS reaction virial,
+and is not a newly derived CG pressure/virial estimator. The fixed-COM
+projection does not modify either sampled force buffer or this virial.
+Do not compare it directly with constraint-inclusive EDR `Vir-XX` etc.
+
+The implementation requests virial computation on every selected sample;
+otherwise the MD loop may not have a valid virial on that step. This can
+increase GPU/CPU force-evaluation cost. Stride controls that cost as well as
+sample density. Accumulation uses O(number of molecules) memory; output is
+written once on normal loop exit, including a graceful stop. Abrupt process
+termination loses the averages. Checkpoint restart remains unsupported, and
+multiple time stepping is rejected for this output.
+
+The text file contains `samples`, `skip_steps`, `stride`, `beads`, one
+`force bead Fx Fy Fz` row per bead and three `virial` rows (x,y,z).
+With zero samples it reports `samples 0` and omits undefined force/virial
+averages. Output paths are opened at startup, so use new filenames for new runs.
+
+For validation only, `GMX_FIXED_MOLECULAR_COM_AVERAGE_VIRIAL_FILE` enables
+instantaneous text rows `relative_step time_ps XX XY XZ YX YY YZ ZX ZY ZZ`
+at selected samples. Leave it unset for production. All output paths must
+be distinct. Repeat the local online/offline regression with:
+
+```bash
+python3 admin/validate-fixed-com-average.py \
+    --gmx /home/flos/gromacs-fixed-com-build/bin/gmx_mpi \
+    --gro /home/flos/MeOH-H2O/systems/cluster_grid/xm_050/production.gro \
+    --top /home/flos/CGWorkflow/benchmarks/pull-constraint-20260901/inputs/topol.local.top \
+    --output /tmp/fixed-com-average-test
+```
+
+Local validation on 2026-09-08 used 500 water + 500 methanol molecules on
+RTX 3060, GPU nonbonded/PME and CPU update. Over 8 integration steps,
+same-run online/offline force and all nine virial averages differed by
+exactly 0 at the recorded precision: 9 samples with skip=0/stride=1,
+6 with skip=3/stride=1, and 3 with skip=2/stride=3. Nonzero init-step=10
+verified run-relative skipping. The sparse case used nstcalcenergy=100,
+so its samples explicitly exercised additional virial requests.
+Skip=9 produced zero samples. A run with nstfout=0 produced averages and
+no TRR. Invalid skip, stride and missing fixed-COM activation failed loudly.
+Separate GPU trajectories are not bitwise reproducible: average on/off
+maximum instantaneous force difference was 0.02759 kJ mol^-1 nm^-1, versus
+0.02728 between two average-off repeats. These short tests validate the
+accumulator and integration hook, not statistical convergence of RMF labels.
+
 ## Molecular physical-force stream
 
 Set `GMX_FIXED_MOLECULAR_COM_FORCE_FILE` to request a binary stream of

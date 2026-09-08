@@ -41,6 +41,7 @@
 #include "gmxpre.h"
 
 #include <cinttypes>
+#include <charconv>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +51,7 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -223,9 +225,31 @@ public:
 
     void write(double time, gmx::ArrayRef<const gmx::RVec> forces)
     {
+        sumForces(topology_, forces, &values_);
+        stream_.write(reinterpret_cast<const char*>(&time), sizeof(time));
+        stream_.write(reinterpret_cast<const char*>(values_.data()),
+                      static_cast<std::streamsize>(values_.size() * sizeof(values_.front())));
+        stream_.flush();
+        if (!stream_)
+        {
+            gmx_fatal(FARGS, "Could not write GMX_FIXED_MOLECULAR_COM_FORCE_FILE.");
+        }
+    }
+
+    // Keep the instantaneous estimator (including float summation) identical for both outputs.
+    static void sumForces(const gmx_mtop_t& topology_,
+                          gmx::ArrayRef<const gmx::RVec> forces,
+                          std::vector<float>* values)
+    {
         GMX_RELEASE_ASSERT(forces.ssize() == topology_.natoms,
                            "Molecular-COM force output requires all atom forces on one rank.");
-        values_.assign(3 * moleculeCount_, 0.0F);
+        size_t moleculeCount = 0;
+        for (const auto& block : topology_.molblock)
+        {
+            moleculeCount += block.nmol;
+        }
+        auto& values_ = *values;
+        values_.assign(DIM * moleculeCount, 0.0F);
         size_t moleculeIndex = 0;
         for (size_t blockIndex = 0; blockIndex < topology_.molblock.size(); ++blockIndex)
         {
@@ -244,14 +268,6 @@ public:
                 }
             }
         }
-        stream_.write(reinterpret_cast<const char*>(&time), sizeof(time));
-        stream_.write(reinterpret_cast<const char*>(values_.data()),
-                      static_cast<std::streamsize>(values_.size() * sizeof(values_.front())));
-        stream_.flush();
-        if (!stream_)
-        {
-            gmx_fatal(FARGS, "Could not write GMX_FIXED_MOLECULAR_COM_FORCE_FILE.");
-        }
     }
 
 private:
@@ -259,6 +275,153 @@ private:
     uint64_t           moleculeCount_ = 0;
     std::ofstream      stream_;
     std::vector<float> values_;
+};
+
+//! Optional bounded-memory averages of the existing force estimator and do_force virial.
+class FixedMolecularComAverage
+{
+public:
+    FixedMolecularComAverage(const char* path, const gmx_mtop_t& topology) : topology_(topology)
+    {
+        skip_   = readInteger("GMX_FIXED_MOLECULAR_COM_AVERAGE_SKIP_STEPS", 0, 0);
+        stride_ = readInteger("GMX_FIXED_MOLECULAR_COM_AVERAGE_STRIDE", 1, 1);
+        for (const auto& block : topology.molblock)
+        {
+            forceSum_.resize(forceSum_.size() + DIM * block.nmol, 0.0);
+        }
+        output_.open(path);
+        if (!output_)
+        {
+            gmx_fatal(FARGS, "Could not open fixed-COM average file.");
+        }
+        output_ << std::setprecision(17);
+        // Optional diagnostic only; production averaging needs no per-frame output.
+        if (const char* debug = std::getenv("GMX_FIXED_MOLECULAR_COM_AVERAGE_VIRIAL_FILE"))
+        {
+            if (std::string(debug) == path)
+            {
+                gmx_fatal(FARGS, "Fixed-COM average and diagnostic paths must differ.");
+            }
+            virialOutput_.open(debug);
+            if (!virialOutput_)
+            {
+                gmx_fatal(FARGS, "Could not open fixed-COM diagnostic virial file.");
+            }
+            virialOutput_ << std::setprecision(17);
+        }
+    }
+
+    bool samples(int64_t relativeStep) const
+    {
+        return relativeStep >= skip_ && (relativeStep - skip_) % stride_ == 0;
+    }
+
+    void accumulate(int64_t relativeStep, double time,
+                    gmx::ArrayRef<const gmx::RVec> forces, const matrix virial)
+    {
+        FixedMolecularComForceWriter::sumForces(topology_, forces, &values_);
+        for (size_t i = 0; i < values_.size(); ++i)
+        {
+            forceSum_[i] += values_[i];
+        }
+        if (virialOutput_.is_open())
+        {
+            virialOutput_ << relativeStep << ' ' << time;
+        }
+        for (int i = 0; i < DIM; ++i)
+        {
+            for (int j = 0; j < DIM; ++j)
+            {
+                virialSum_[DIM * i + j] += virial[i][j];
+                if (virialOutput_.is_open())
+                {
+                    virialOutput_ << ' ' << virial[i][j];
+                }
+            }
+        }
+        if (virialOutput_.is_open())
+        {
+            virialOutput_ << '\n';
+            if (!virialOutput_)
+            {
+                gmx_fatal(FARGS, "Could not write fixed-COM diagnostic virial.");
+            }
+        }
+        ++count_;
+    }
+
+    void finish()
+    {
+        output_ << "# fixed molecular COM average v1\nsamples " << count_
+                << "\nskip_steps " << skip_ << "\nstride " << stride_
+                << "\nbeads " << forceSum_.size() / DIM << '\n';
+        if (count_ != 0)
+        {
+            output_ << "# bead (1-based topology order), mean Fx Fy Fz [kJ mol^-1 nm^-1]\n";
+            for (size_t i = 0; i < forceSum_.size(); i += DIM)
+            {
+                output_ << "force " << i / DIM + 1;
+                for (int d = 0; d < DIM; ++d)
+                {
+                    output_ << ' ' << forceSum_[i + d] / count_;
+                }
+                output_ << '\n';
+            }
+            output_ << "# mean force_vir [kJ mol^-1], GROMACS Xi convention; rows x,y,z\n";
+            for (int i = 0; i < DIM; ++i)
+            {
+                output_ << "virial";
+                for (int j = 0; j < DIM; ++j)
+                {
+                    output_ << ' ' << virialSum_[DIM * i + j] / count_;
+                }
+                output_ << '\n';
+            }
+        }
+        else
+        {
+            output_ << "# No production samples; averages undefined.\n";
+        }
+        output_.close();
+        if (!output_)
+        {
+            gmx_fatal(FARGS, "Could not write fixed-COM averages.");
+        }
+        if (virialOutput_.is_open())
+        {
+            virialOutput_.close();
+            if (!virialOutput_)
+            {
+                gmx_fatal(FARGS, "Could not close fixed-COM diagnostic virial.");
+            }
+        }
+    }
+
+private:
+    static int64_t readInteger(const char* name, int64_t fallback, int64_t minimum)
+    {
+        const char* text = std::getenv(name);
+        if (text == nullptr)
+        {
+            return fallback;
+        }
+        const std::string input(text);
+        int64_t value = 0;
+        const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
+        if (result.ec != std::errc() || result.ptr != input.data() + input.size() || value < minimum)
+        {
+            gmx_fatal(FARGS, "%s must be an integer >= %" PRId64 ".", name, minimum);
+        }
+        return value;
+    }
+
+    const gmx_mtop_t& topology_;
+    int64_t skip_ = 0, stride_ = 1;
+    uint64_t count_ = 0;
+    std::vector<float> values_;
+    std::vector<double> forceSum_;
+    std::array<double, DIM * DIM> virialSum_{};
+    std::ofstream output_, virialOutput_;
 };
 
 } // namespace
@@ -450,6 +613,30 @@ void gmx::LegacySimulator::do_md()
     }
 
     std::optional<FixedMolecularComForceWriter> fixedMolecularComForceWriter;
+    std::optional<FixedMolecularComAverage> fixedMolecularComAverage;
+    if (const char* averageFile = std::getenv("GMX_FIXED_MOLECULAR_COM_AVERAGE_FILE"))
+    {
+        if (std::getenv("GMX_FIXED_MOLECULAR_COM") == nullptr)
+        {
+            gmx_fatal(FARGS, "Fixed-COM averaging requires GMX_FIXED_MOLECULAR_COM.");
+        }
+        if (simulationWork.useMts)
+        {
+            gmx_fatal(FARGS, "Fixed-COM averaging does not support multiple time stepping.");
+        }
+        if (isMainRank)
+        {
+            const char* forceFile = std::getenv("GMX_FIXED_MOLECULAR_COM_FORCE_FILE");
+            const char* virialFile = std::getenv("GMX_FIXED_MOLECULAR_COM_AVERAGE_VIRIAL_FILE");
+            if (forceFile != nullptr
+                && (std::string(forceFile) == averageFile
+                    || (virialFile != nullptr && std::string(forceFile) == virialFile)))
+            {
+                gmx_fatal(FARGS, "Fixed-COM force stream and average paths must differ.");
+            }
+            fixedMolecularComAverage.emplace(averageFile, topGlobal_);
+        }
+    }
     if (std::getenv("GMX_FIXED_MOLECULAR_COM") != nullptr && isMainRank)
     {
         if (const char* forceFile = std::getenv("GMX_FIXED_MOLECULAR_COM_FORCE_FILE"))
@@ -1203,8 +1390,14 @@ void gmx::LegacySimulator::do_md()
         const bool needEnergyAndVirial = do_ene || do_log || bDoReplEx;
 
         const bool bCalcEnerStep = do_per_step(step, ir->nstcalcenergy);
+        const bool sampleFixedCom = fixedMolecularComAverage
+                                    && fixedMolecularComAverage->samples(step - ir->init_step);
         const bool bCalcVir      = [&]() -> bool
         {
+            if (sampleFixedCom)
+            {
+                return true;
+            }
             auto doPressureCoupling = [ir](int64_t s) -> bool
             {
                 return ir->pressureCouplingOptions.epc != PressureCoupling::No
@@ -1542,6 +1735,10 @@ void gmx::LegacySimulator::do_md()
             if (fixedMolecularComForceWriter && do_per_step(step, ir->nstfout))
             {
                 fixedMolecularComForceWriter->write(t, f.view().force());
+            }
+            if (sampleFixedCom)
+            {
+                fixedMolecularComAverage->accumulate(step - ir->init_step, t, f.view().force(), force_vir);
             }
             /* Check if IMD step and do IMD communication, if bIMD is TRUE. */
             bInteractiveMDstep = imdSession_->run(step, bNS, state_->box, state_->x, t);
@@ -2296,6 +2493,10 @@ void gmx::LegacySimulator::do_md()
         }
     }
     /* End of main MD loop */
+    if (fixedMolecularComAverage)
+    {
+        fixedMolecularComAverage->finish();
+    }
 
     /* Closing TNG files can include compressing data. Therefore it is good to do that
      * before stopping the time measurements. */
