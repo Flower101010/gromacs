@@ -214,15 +214,43 @@ python3 admin/validate-fixed-com-saved-vs-rerun.py \
     --output /tmp/fixed-com-saved-vs-rerun
 ```
 
-On 2026-09-08, 11 frames of the 500 SOL + 500 MEOH fixture on RTX 3060
-(GPU nonbonded/PME, CPU update) gave a saved-versus-rerun maximum component
-difference of `0.02427 kJ mol^-1 nm^-1` and RMS `0.00297`. The largest mapped
-force component was `1318.36`, so the maximum relative difference was
-`1.84e-5`. A second independent rerun differed from the first by at most
-`0.0110` (RMS `0.000486`). These are single-precision GPU force-evaluation
-roundoff/order differences; they are not COM-constraint reactions. The
-11-frame time-average difference was `0.01260` maximum component and
-`0.00190` RMS, a deliberately short non-converged diagnostic.
+The test records three independent links. It compares the binary stream with
+atom forces in the production TRR written by `do_md_trajectory_writing`
+immediately before the stream writer. It also runs the same fresh TPR twice
+with `-nsteps 0`, fixed-COM OFF and ON. The ON run executes fixed-COM
+initialization and internal constraints but no integration step, so it is a
+direct test for force-array contamination. Finally it compares time averages
+to a contiguous-block SEM from the live saved samples.
+
+On 2026-09-08, the 500 SOL + 500 MEOH fixture was run on RTX 3060 with GPU
+nonbonded/PME and CPU update. In the 101-frame, 10 ps test (sampled every
+0.1 ps), stream versus same-live-buffer TRR force sums differed by at most
+`1.39e-4 kJ mol^-1 nm^-1` (RMS `1.48e-5`), limited by float trajectory text
+decoding. Production and rerun coordinates agreed within minimum-image
+`1.21e-7 nm`; the rerun input is therefore the `do_force()` state.
+
+At a real live `-nsteps 0` fixed-COM ON/OFF single point, mapped forces
+differed by at most `9.46e-4` (RMS `1.26e-4`) kJ mol^-1 nm^-1. The ON/OFF
+rerun comparison across 101 frames was `1.45e-3` maximum and `1.20e-4` RMS.
+These are GPU roundoff/order differences and rule out a COM reaction force in
+the sampled array.
+
+Saved-versus-rerun instantaneous forces in the 101-frame mixed test had
+maximum difference `0.02877` and RMS `0.001336 kJ mol^-1 nm^-1`, against a
+largest mapped component of `1806.31` (relative maximum `1.59e-5`). Their
+mean-force difference was `0.000866` maximum component and `0.000174` RMS.
+The signed global `(x,y,z)` difference was
+`(-1.19e-7, -1.04e-6, 4.85e-7) kJ mol^-1 nm^-1`; it has no detectable bias.
+Using ten contiguous blocks of ten saved samples, mean-difference/block-SEM
+had median `9.12e-6`, 95th percentile `3.89e-5`, and maximum `1.92e-4`.
+This is far below the RMF sampling error; this short test estimates numerical
+comparison uncertainty, not production RMF convergence.
+
+The virtual-site and no-virtual-site paths were separately covered with 51
+frames each: pure TIP4P/2005 water (`x_MeOH=0`) and pure TraPPE-UA methanol
+(`x_MeOH=1`). Stream-versus-live-buffer maxima were `1.27e-4` and `1.29e-4`.
+Their saved-versus-rerun mean/SEM maximum ratios were `3.56e-4` and
+`1.01e-4`, respectively. All force values use kJ mol^-1 nm^-1.
 
 Consequently, use the online average or saved force stream directly for the
 same force field and run settings. Use rerun only when you intentionally need
