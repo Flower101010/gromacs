@@ -194,6 +194,42 @@ projection changes positions and velocities only; it does not add a reaction
 force to this buffer. This is the physical mapped force suitable for later
 conditional averaging, not `pullf.xvg` and not a constraint reaction force.
 
+### Saved force versus `mdrun -rerun`
+
+For this supported fixed-COM workflow, a rerun is not required to make the
+mapped force physical. The saved stream is calculated by the same `do_force()`
+call as `mdrun -rerun`, at the same saved coordinates, after virtual-site force
+spreading and before the coordinate update. Rerun reads positions only and
+does not apply the COM projection or integrate a timestep.
+
+The following local test generates a complete per-frame TRR (coordinates,
+box and forces), reruns it twice with the same TPR, and compares the saved
+whole-molecule force sums against independently summed rerun atom forces:
+
+```bash
+python3 admin/validate-fixed-com-saved-vs-rerun.py \
+    --gmx /home/flos/gromacs-fixed-com-build/bin/gmx_mpi \
+    --gro /home/flos/MeOH-H2O/systems/cluster_grid/xm_050/production.gro \
+    --top /home/flos/CGWorkflow/benchmarks/pull-constraint-20260901/inputs/topol.local.top \
+    --output /tmp/fixed-com-saved-vs-rerun
+```
+
+On 2026-09-08, 11 frames of the 500 SOL + 500 MEOH fixture on RTX 3060
+(GPU nonbonded/PME, CPU update) gave a saved-versus-rerun maximum component
+difference of `0.02427 kJ mol^-1 nm^-1` and RMS `0.00297`. The largest mapped
+force component was `1318.36`, so the maximum relative difference was
+`1.84e-5`. A second independent rerun differed from the first by at most
+`0.0110` (RMS `0.000486`). These are single-precision GPU force-evaluation
+roundoff/order differences; they are not COM-constraint reactions. The
+11-frame time-average difference was `0.01260` maximum component and
+`0.00190` RMS, a deliberately short non-converged diagnostic.
+
+Consequently, use the online average or saved force stream directly for the
+same force field and run settings. Use rerun only when you intentionally need
+forces under a different TPR/force field, or when an older trajectory omitted
+the forces and must be evaluated afterwards. A rerun does not improve the
+scientific definition or remove this normal GPU rounding difference.
+
 The little-endian file protocol is:
 
 | Offset | Type | Content |
