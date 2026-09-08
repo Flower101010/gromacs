@@ -94,6 +94,7 @@
 #include "gromacs/mdlib/checkpointhandler.h"
 #include "gromacs/mdlib/constr.h"
 #include "gromacs/mdlib/coupling.h"
+#include "gromacs/mdlib/dispersioncorrection.h"
 #include "gromacs/mdlib/ebin.h"
 #include "gromacs/mdlib/enerdata_utils.h"
 #include "gromacs/mdlib/energyoutput.h"
@@ -367,7 +368,7 @@ public:
                 }
                 output_ << '\n';
             }
-            output_ << "# mean force_vir [kJ mol^-1], GROMACS Xi convention; rows x,y,z\n";
+            output_ << "# mean microscopic force virial without DispCorr [kJ mol^-1], GROMACS Xi convention; rows x,y,z\n";
             for (int i = 0; i < DIM; ++i)
             {
                 output_ << "virial";
@@ -1738,7 +1739,27 @@ void gmx::LegacySimulator::do_md()
             }
             if (sampleFixedCom)
             {
-                fixedMolecularComAverage->accumulate(step - ir->init_step, t, f.view().force(), force_vir);
+                // do_force() adds the isotropic long-range DispCorr in-place to force_vir.
+                // RMF labels use the microscopic configurational virial without that tail term.
+                tensor noDispersionCorrectionVirial;
+                copy_mat(force_vir, noDispersionCorrectionVirial);
+                if (fr_->dispersionCorrection)
+                {
+                    tensor dispersionCorrectionVirial = { { 0 } };
+                    const auto correction = fr_->dispersionCorrection->calculate(
+                            state_->box,
+                            state_->lambda[static_cast<int>(FreeEnergyPerturbationCouplingType::Vdw)]);
+                    correction.correctVirial(dispersionCorrectionVirial);
+                    for (int i = 0; i < DIM; ++i)
+                    {
+                        for (int j = 0; j < DIM; ++j)
+                        {
+                            noDispersionCorrectionVirial[i][j] -= dispersionCorrectionVirial[i][j];
+                        }
+                    }
+                }
+                fixedMolecularComAverage->accumulate(
+                        step - ir->init_step, t, f.view().force(), noDispersionCorrectionVirial);
             }
             /* Check if IMD step and do IMD communication, if bIMD is TRUE. */
             bInteractiveMDstep = imdSession_->run(step, bNS, state_->box, state_->x, t);

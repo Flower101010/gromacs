@@ -119,15 +119,20 @@ the same float per-molecule summation over all sites, followed by double
 accumulation across samples. Force rows use 1-based topology molecule order
 and units kJ mol^-1 nm^-1. No constraint-force estimator is changed.
 
-Virial rows are the nine components of `force_vir` from `do_force()` at the
-same configuration as the forces, before integration. This is the physical
-force virial, including PME, virtual-site handling and configured dispersion
-correction, in GROMACS Xi convention (the usual -1/2 force-position convention),
-units kJ mol^-1. It is **not** the later `total_vir = force_vir + shake_vir`,
-does not include kinetic stress or internal SETTLE/LINCS reaction virial,
-and is not a newly derived CG pressure/virial estimator. The fixed-COM
-projection does not modify either sampled force buffer or this virial.
-Do not compare it directly with constraint-inclusive EDR `Vir-XX` etc.
+Virial rows are the nine components of the physical `force_vir` from
+`do_force()` at the same configuration as the forces, before integration,
+with GROMACS's analytic long-range dispersion correction removed. Thus this
+is the requested microscopic configurational **no-DispCorr** virial: it
+includes short-range and PME contributions plus virtual-site force handling,
+but excludes only the `DispCorr` tail term. It uses GROMACS Xi convention
+(the usual -1/2 force-position convention) and units kJ mol^-1.
+
+It is **not** the later `total_vir = force_vir + shake_vir`: it contains no
+kinetic stress, SETTLE/LINCS reaction virial, or fixed-COM projection reaction.
+It is not reconstructed from pressure, and it is not a rerun quantity. The
+fixed-COM projection does not modify either sampled force buffer or this
+virial. Do not compare it directly with constraint-inclusive EDR `Vir-XX`
+etc.
 
 The implementation requests virial computation on every selected sample;
 otherwise the MD loop may not have a valid virial on that step. This can
@@ -144,8 +149,9 @@ averages. Output paths are opened at startup, so use new filenames for new runs.
 
 For validation only, `GMX_FIXED_MOLECULAR_COM_AVERAGE_VIRIAL_FILE` enables
 instantaneous text rows `relative_step time_ps XX XY XZ YX YY YZ ZX ZY ZZ`
-at selected samples. Leave it unset for production. All output paths must
-be distinct. Repeat the local online/offline regression with:
+of this no-DispCorr tensor at selected samples. Leave it unset for production.
+All output paths must be distinct. Repeat the local online/offline regression
+with:
 
 ```bash
 python3 admin/validate-fixed-com-average.py \
@@ -154,6 +160,25 @@ python3 admin/validate-fixed-com-average.py \
     --top /home/flos/CGWorkflow/benchmarks/pull-constraint-20260901/inputs/topol.local.top \
     --output /tmp/fixed-com-average-test
 ```
+
+The dispersion-correction-specific regression uses normal MD only (never
+`mdrun -rerun`):
+
+```bash
+python3 admin/validate-fixed-com-no-dispcorr-virial.py \
+    --gmx /home/flos/gromacs-fixed-com-build/bin/gmx_mpi \
+    --gro /home/flos/MeOH-H2O/systems/cluster_grid/xm_050/production.gro \
+    --top /home/flos/CGWorkflow/benchmarks/pull-constraint-20260901/inputs/topol.local.top \
+    --output /home/flos/.cache/fixed-com-validation/no-dispcorr-virial \
+    --steps 0
+```
+
+At zero steps all runs evaluate identical initial coordinates. It checks that
+`DispCorr=EnerPres` after online subtraction agrees with `DispCorr=no` within
+the independent GPU repeat floor. A short multi-step run also checks that the
+accumulated tensor equals the arithmetic mean of every diagnostic sample
+exactly at text precision; cross-run multi-step differences include normal GPU
+trajectory roundoff divergence.
 
 Local validation on 2026-09-08 used 500 water + 500 methanol molecules on
 RTX 3060, GPU nonbonded/PME and CPU update. Over 8 integration steps,
