@@ -52,6 +52,17 @@ for repo_file in /etc/yum.repos.d/CentOS-*.repo; do
 done
 yum clean all >/dev/null
 yum install -y centos-release-scl || true
+# centos-release-scl creates its own repository files after the first rewrite
+# above, so rewrite all repositories once more before installing devtoolset.
+for repo_file in /etc/yum.repos.d/*.repo; do
+    [[ -f "${repo_file}" ]] || continue
+    sed -i \
+        -e 's|^mirrorlist=|#mirrorlist=|' \
+        -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+        -e 's|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+        "${repo_file}"
+done
+yum clean all >/dev/null
 yum install -y \
     bzip2 curl file git gzip make perl tar wget xz zlib-devel \
     devtoolset-11-gcc devtoolset-11-gcc-c++
