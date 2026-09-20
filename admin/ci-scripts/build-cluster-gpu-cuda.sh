@@ -83,8 +83,10 @@ curl -fsSL \
     "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-x86_64.sh" \
     -o "${deps}/cmake.sh"
 chmod +x "${deps}/cmake.sh"
-"${deps}/cmake.sh" --skip-license --prefix=/opt/cmake
-cmake_bin=/opt/cmake/bin/cmake
+cmake_prefix="${deps}/cmake"
+mkdir -p "${cmake_prefix}"
+"${deps}/cmake.sh" --skip-license --prefix="${cmake_prefix}"
+cmake_bin="${cmake_prefix}/bin/cmake"
 
 fftw_version=3.3.10
 curl -fsSL "https://www.fftw.org/fftw-${fftw_version}.tar.gz" -o "${deps}/fftw.tar.gz"
@@ -213,7 +215,7 @@ ACTIVATE
 chmod +x "${install_prefix}/bin/activate"
 
 env -i \
-    PATH="/opt/openmpi/bin:/opt/cmake/bin:/usr/bin:/bin" \
+    PATH="/opt/openmpi/bin:${cmake_prefix}/bin:/usr/bin:/bin" \
     LD_LIBRARY_PATH="${install_prefix}/lib/host:${install_prefix}/lib/cuda:${install_prefix}/lib:/opt/openmpi/lib" \
     GMXDATA="${install_prefix}/share/gromacs" \
     "${install_prefix}/bin/gmx_mpi" --version | tee /out/gromacs-gpu-version.txt
