@@ -132,7 +132,7 @@ export CMAKE_PREFIX_PATH=/opt/fftw
     -DMPI_C_COMPILER=/opt/openmpi/bin/mpicc \
     -DMPI_CXX_COMPILER=/opt/openmpi/bin/mpicxx \
     -DCUDAToolkit_ROOT="${cuda_root}" \
-    -DCMAKE_INSTALL_RPATH='$ORIGIN;$ORIGIN/host;$ORIGIN/cuda;$ORIGIN/../lib;$ORIGIN/../lib/host;$ORIGIN/../lib/cuda' \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN;$ORIGIN/host;$ORIGIN/cuda;$ORIGIN/../lib;$ORIGIN/../lib/host;$ORIGIN/../lib/cuda;$ORIGIN/../lib64;$ORIGIN/../lib64/host;$ORIGIN/../lib64/cuda' \
     -DGMX_MPI=ON \
     -DGMX_THREAD_MPI=OFF \
     -DGMX_GPU=CUDA \
@@ -148,14 +148,19 @@ export CMAKE_PREFIX_PATH=/opt/fftw
 "${cmake_bin}" --build "${build_root}" --parallel "${build_jobs}"
 "${cmake_bin}" --install "${build_root}"
 
-mkdir -p "${install_prefix}/lib/cuda" "${install_prefix}/lib/host"
+if [[ -d "${install_prefix}/lib64" ]]; then
+    install_libdir="${install_prefix}/lib64"
+else
+    install_libdir="${install_prefix}/lib"
+fi
+mkdir -p "${install_libdir}/cuda" "${install_libdir}/host"
 
 # Copy the CUDA user-space libraries needed by the installed GROMACS shared
 # library. libcuda.so.1 is deliberately excluded: it is supplied by the GPU
 # driver on each compute node and must never be replaced by the toolkit stub.
 copy_cuda_closure() {
     local pending=() seen_file dep real base
-    pending=("${install_prefix}/lib/libgromacs_mpi.so.11")
+    pending=("${install_libdir}/libgromacs_mpi.so.11")
     declare -A seen=()
     while ((${#pending[@]})); do
         dep="${pending[0]}"
@@ -171,7 +176,7 @@ copy_cuda_closure() {
                     case "${base}" in
                         libcuda.so*|libnvidia-ml.so*) continue ;;
                     esac
-                    cp -L "${real}" "${install_prefix}/lib/cuda/${base}"
+                    cp -L "${real}" "${install_libdir}/cuda/${base}"
                     pending+=("${real}")
                     ;;
             esac
@@ -187,16 +192,16 @@ copy_cuda_closure
 # Bundle the GCC runtime, avoiding the GCC 10.2 libstdc++ mismatch seen in
 # the old build when a shell selected the wrong compiler module.
 for runtime_name in libstdc++.so.6 libgcc_s.so.1 libgomp.so.1; do
-    runtime_lib="$(find /opt/rh/devtoolset-11/root/usr -name "${runtime_name}" -print -quit)"
+    runtime_lib="$(find /opt/rh/devtoolset-11/root/usr -name "${runtime_name}*" -print -quit)"
     [[ -f "${runtime_lib}" ]] || { echo "Missing ${runtime_name}" >&2; exit 1; }
-    cp -L "${runtime_lib}" "${install_prefix}/lib/host/"
+    cp -L "${runtime_lib}" "${install_libdir}/host/${runtime_name}"
 done
 
 # Include the FFTW runtime as well; the target only needs its site OpenMPI
 # module in addition to this package.
 for fftw_lib in /opt/fftw/lib/libfftw3f.so*; do
     [[ -e "${fftw_lib}" ]] || { echo "Missing FFTW runtime" >&2; exit 1; }
-    cp -L "${fftw_lib}" "${install_prefix}/lib/"
+    cp -L "${fftw_lib}" "${install_libdir}/"
 done
 
 cat > "${install_prefix}/bin/activate" <<'ACTIVATE'
@@ -206,7 +211,11 @@ if command -v module >/dev/null 2>&1; then
     module load OpenMPI/4.0.4 >/dev/null 2>&1 || true
 fi
 export GMXBIN="${_gmx_cluster_root}/bin"
-export GMXLDLIB="${_gmx_cluster_root}/lib"
+if [[ -d "${_gmx_cluster_root}/lib64" ]]; then
+    export GMXLDLIB="${_gmx_cluster_root}/lib64"
+else
+    export GMXLDLIB="${_gmx_cluster_root}/lib"
+fi
 export GMXDATA="${_gmx_cluster_root}/share/gromacs"
 export PATH="${GMXBIN}:${PATH}"
 export LD_LIBRARY_PATH="${GMXLDLIB}/host:${GMXLDLIB}/cuda:${GMXLDLIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -216,7 +225,7 @@ chmod +x "${install_prefix}/bin/activate"
 
 env -i \
     PATH="/opt/openmpi/bin:${cmake_prefix}/bin:/usr/bin:/bin" \
-    LD_LIBRARY_PATH="${install_prefix}/lib/host:${install_prefix}/lib/cuda:${install_prefix}/lib:/opt/openmpi/lib" \
+    LD_LIBRARY_PATH="${install_libdir}/host:${install_libdir}/cuda:${install_libdir}:/opt/openmpi/lib" \
     GMXDATA="${install_prefix}/share/gromacs" \
     "${install_prefix}/bin/gmx_mpi" --version | tee /out/gromacs-gpu-version.txt
 
