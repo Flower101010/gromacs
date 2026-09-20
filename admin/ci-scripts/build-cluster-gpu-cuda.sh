@@ -192,7 +192,13 @@ copy_cuda_closure
 # Bundle the GCC runtime, avoiding the GCC 10.2 libstdc++ mismatch seen in
 # the old build when a shell selected the wrong compiler module.
 for runtime_name in libstdc++.so.6 libgcc_s.so.1 libgomp.so.1; do
-    runtime_lib="$(find /opt/rh/devtoolset-11/root/usr -name "${runtime_name}*" -print -quit)"
+    runtime_lib="$(g++ -print-file-name="${runtime_name}")"
+    if [[ ! -f "${runtime_lib}" ]]; then
+        runtime_lib="$(gcc -print-file-name="${runtime_name}")"
+    fi
+    if [[ ! -f "${runtime_lib}" ]]; then
+        runtime_lib="$(find /opt/rh/devtoolset-11 -name "${runtime_name}*" -print -quit)"
+    fi
     [[ -f "${runtime_lib}" ]] || { echo "Missing ${runtime_name}" >&2; exit 1; }
     cp -L "${runtime_lib}" "${install_libdir}/host/${runtime_name}"
 done
