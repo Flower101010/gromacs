@@ -30,7 +30,7 @@ docker run --rm \
     -v "${repo_root}/build:/out" \
     -w /src \
     "${cuda_container}" \
-    bash -s -- <<'CONTAINER_SCRIPT'
+    -s -- <<'CONTAINER_SCRIPT'
 set -euo pipefail
 
 build_jobs="${BUILD_JOBS:-4}"
