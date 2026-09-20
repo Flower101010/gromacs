@@ -22,6 +22,7 @@ mkdir -p "${artifact_dir}"
 docker pull "${cuda_container}"
 
 docker run --rm \
+    --entrypoint /bin/bash \
     --user 0:0 \
     -e BUILD_JOBS="${build_jobs}" \
     -e GITHUB_SHA="${GITHUB_SHA:-local}" \
