@@ -116,8 +116,17 @@ can remain enabled.
 
 The force estimator is exactly the existing molecular force stream estimator:
 the same float per-molecule summation over all sites, followed by double
-accumulation across samples. Force rows use 1-based topology molecule order
-and units kJ mol^-1 nm^-1. No constraint-force estimator is changed.
+accumulation across samples. To keep the hot path inexpensive while reducing
+long-run summation error, selected samples first accumulate into a fixed
+256-sample double block and the completed block is then added to the global
+double sum. This is not Kahan/Neumaier compensation and does not change the
+force calculation or GPU reduction. Force rows use 1-based topology molecule
+order and units kJ mol^-1 nm^-1. No constraint-force estimator is changed.
+
+Each mapped force component and virial component is checked for a finite value,
+and both block and global additions are checked for a finite result. A
+non-finite value or an exhausted sample counter aborts the run with the
+relative step, time, and component rather than silently writing a NaN average.
 
 Virial rows are the nine components of the physical `force_vir` from
 `do_force()` at the same configuration as the forces, before integration,
@@ -138,9 +147,11 @@ The implementation requests virial computation on every selected sample;
 otherwise the MD loop may not have a valid virial on that step. This can
 increase GPU/CPU force-evaluation cost. Stride controls that cost as well as
 sample density. Accumulation uses O(number of molecules) memory; output is
-written once on normal loop exit, including a graceful stop. Abrupt process
-termination loses the averages. Checkpoint restart remains unsupported, and
-multiple time stepping is rejected for this output.
+written once on normal loop exit, including a graceful stop. The block
+accumulator uses one additional double vector of molecule-force size and nine
+additional doubles for the virial; it does not write per-sample data. Abrupt
+process termination loses the averages. Checkpoint restart remains
+unsupported, and multiple time stepping is rejected for this output.
 
 The text file contains `samples`, `skip_steps`, `stride`, `beads`, one
 `force bead Fx Fy Fz` row per bead and three `virial` rows (x,y,z).

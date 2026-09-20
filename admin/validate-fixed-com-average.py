@@ -4,6 +4,8 @@
 Requires the existing fixed-COM GRO/topology fixture. All outputs go to a new directory.
 Uses only the Python standard library. The optional diagnostic records do_force's
 actual nine virial components, not the constraint-inclusive EDR pressure virial.
+For longer runs, independent GPU trajectories are expected to diverge; exact
+online/offline force checks therefore use runs that also save the force stream.
 """
 import argparse
 import json
@@ -18,7 +20,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('gmx', 'gro', 'top', 'output'):
         parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--steps', type=int, default=8)
+    parser.add_argument('--ntomp', type=int, default=8)
+    parser.add_argument('--cpu', action='store_true',
+                        help='Use CPU nonbonded/PME for a CPU-only GROMACS build')
+    parser.add_argument('--external-mpi', action='store_true',
+                        help='Do not pass -ntmpi; use with an external-MPI binary')
     args = parser.parse_args()
+    if args.steps < 0:
+        raise SystemExit('--steps must be non-negative')
+    if args.ntomp < 1:
+        raise SystemExit('--ntomp must be positive')
     args.gmx, args.gro, args.top, args.output = (
         p.resolve() for p in (args.gmx, args.gro, args.top, args.output))
     args.output.mkdir(parents=True, exist_ok=False)
@@ -36,6 +48,12 @@ def main():
 
     report = {}
     streams = {}
+    mpi_options = [] if args.external_mpi else ['-ntmpi', '1']
+    force_options = ['-update', 'cpu']
+    if args.cpu:
+        force_options += ['-nb', 'cpu', '-pme', 'cpu']
+    else:
+        force_options += ['-nb', 'gpu', '-pme', 'gpu', '-notunepme']
     for label, skip, stride, force_output, energy_stride in (
             ('all', 0, 1, 1, 1), ('skip', 3, 1, 1, 1), ('sparse', 2, 3, 1, 100),
             ('empty', 9, 1, 1, 1), ('no_trajectory', 0, 1, 0, 1),
@@ -43,7 +61,7 @@ def main():
         directory = args.output / label
         directory.mkdir()
         mdp = template
-        for key, value in {'nsteps': 8, 'nstfout': force_output,
+        for key, value in {'nsteps': args.steps, 'nstfout': force_output,
                            'nstcalcenergy': energy_stride}.items():
             mdp = re.sub(rf'(?m)^{key}\s*=.*$', f'{key} = {value}', mdp)
         (directory / 'run.mdp').write_text(mdp)
@@ -57,15 +75,16 @@ def main():
                           GMX_FIXED_MOLECULAR_COM_AVERAGE_SKIP_STEPS=str(skip),
                           GMX_FIXED_MOLECULAR_COM_AVERAGE_STRIDE=str(stride),
                           GMX_FIXED_MOLECULAR_COM_AVERAGE_VIRIAL_FILE=str(directory / 'virial.txt'))
-        command(['mdrun', '-s', 'run.tpr', '-deffnm', 'run', '-ntomp', '8',
-                 '-update', 'cpu', '-nb', 'gpu', '-pme', 'gpu', '-notunepme'],
+        command(['mdrun', '-s', 'run.tpr', '-deffnm', 'run'] + mpi_options
+                + ['-ntomp', str(args.ntomp)]
+                + force_options,
                 directory, runenv)
         if force_output:
             binary = (directory / 'force.bin').read_bytes()
             magic, version, beads = struct.unpack_from('=8sIQ', binary)
             assert (magic, version) == (b'GMXCOMF1', 1)
             records = list(struct.iter_unpack('=d' + 'f' * (3 * beads), binary[20:]))
-            assert len(records) == 9
+            assert len(records) == args.steps + 1
             streams[label] = records
         if label.startswith('average_off'):
             assert not (directory / 'average.txt').exists()
@@ -73,7 +92,7 @@ def main():
         lines = [line.split() for line in (directory / 'average.txt').read_text().splitlines()
                  if line and not line.startswith('#')]
         count = int(next(line[1] for line in lines if line[0] == 'samples'))
-        selected = list(range(skip, 9, stride))
+        selected = list(range(skip, args.steps + 1, stride))
         assert count == len(selected)
         instantaneous = [list(map(float, line.split())) for line in
                          (directory / 'virial.txt').read_text().splitlines()]
@@ -92,7 +111,10 @@ def main():
         force_error = max(abs(a-b) for a, b in zip(force, offline_force))
         virial_error = max(abs(a-b) for a, b in zip(virial, offline_virial))
         # Separate GPU trajectories need a roundoff tolerance; same-run means do not.
-        assert force_error < (0.1 if not force_output else 1e-10), force_error
+        if force_output:
+            assert force_error < 1e-10, force_error
+        elif args.steps <= 8:
+            assert force_error < 0.1, force_error
         assert virial_error < 1e-10, virial_error
         if not force_output:
             assert not (directory / 'run.trr').exists()
@@ -104,7 +126,8 @@ def main():
     repeat_difference = max(abs(a-b) for row_a, row_b in
                             zip(streams['average_off'], streams['average_off_repeat'])
                             for a, b in zip(row_a, row_b))
-    assert difference < 0.1 and repeat_difference < 0.1, (difference, repeat_difference)
+    if args.steps <= 8:
+        assert difference < 0.1 and repeat_difference < 0.1, (difference, repeat_difference)
     report['average_off'] = dict(max_instantaneous_force_difference=difference,
                                 off_repeat_max_difference=repeat_difference)
     # Fail loudly for invalid configuration, before entering production MD.
@@ -120,8 +143,9 @@ def main():
                 runenv.pop(key)
             else:
                 runenv[key] = value
-        command(['mdrun', '-s', str(args.output / 'all' / 'run.tpr'), '-ntomp', '8',
-                 '-update', 'cpu', '-nb', 'gpu', '-pme', 'gpu'], directory, runenv, success=False)
+        command(['mdrun', '-s', str(args.output / 'all' / 'run.tpr')] + mpi_options
+                + ['-ntomp', str(args.ntomp)]
+                + force_options, directory, runenv, success=False)
         expected = {'bad_skip': 'AVERAGE_SKIP_STEPS must be an integer',
                     'bad_stride': 'AVERAGE_STRIDE must be an integer',
                     'no_fixed_com': 'averaging requires GMX_FIXED_MOLECULAR_COM'}[label]

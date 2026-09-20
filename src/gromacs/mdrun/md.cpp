@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -289,6 +290,7 @@ public:
         for (const auto& block : topology.molblock)
         {
             forceSum_.resize(forceSum_.size() + DIM * block.nmol, 0.0);
+            forceBlockSum_.resize(forceBlockSum_.size() + DIM * block.nmol, 0.0);
         }
         output_.open(path);
         if (!output_)
@@ -323,7 +325,19 @@ public:
         FixedMolecularComForceWriter::sumForces(topology_, forces, &values_);
         for (size_t i = 0; i < values_.size(); ++i)
         {
-            forceSum_[i] += values_[i];
+            const double value = values_[i];
+            checkFinite("molecular force", i, value, relativeStep, time);
+            const double blockValue = forceBlockSum_[i] + value;
+            if (!std::isfinite(blockValue))
+            {
+                gmx_fatal(FARGS,
+                          "Fixed-COM molecular force block accumulation became non-finite at "
+                          "relative step %" PRId64 ", time %.17g ps, component %zu.",
+                          relativeStep,
+                          time,
+                          i);
+            }
+            forceBlockSum_[i] = blockValue;
         }
         if (virialOutput_.is_open())
         {
@@ -333,10 +347,22 @@ public:
         {
             for (int j = 0; j < DIM; ++j)
             {
-                virialSum_[DIM * i + j] += virial[i][j];
+                const double value = virial[i][j];
+                checkFinite("force virial", DIM * i + j, value, relativeStep, time);
+                const double blockValue = virialBlockSum_[DIM * i + j] + value;
+                if (!std::isfinite(blockValue))
+                {
+                    gmx_fatal(FARGS,
+                              "Fixed-COM force virial block accumulation became non-finite at "
+                              "relative step %" PRId64 ", time %.17g ps, component %d.",
+                              relativeStep,
+                              time,
+                              DIM * i + j);
+                }
+                virialBlockSum_[DIM * i + j] = blockValue;
                 if (virialOutput_.is_open())
                 {
-                    virialOutput_ << ' ' << virial[i][j];
+                    virialOutput_ << ' ' << value;
                 }
             }
         }
@@ -348,11 +374,24 @@ public:
                 gmx_fatal(FARGS, "Could not write fixed-COM diagnostic virial.");
             }
         }
+        if (count_ == std::numeric_limits<uint64_t>::max())
+        {
+            gmx_fatal(FARGS, "Fixed-COM average sample count overflowed.");
+        }
         ++count_;
+        ++blockCount_;
+        if (blockCount_ == c_accumulationBlockSize)
+        {
+            flushBlock(relativeStep, time);
+        }
     }
 
     void finish()
     {
+        if (blockCount_ != 0)
+        {
+            flushBlock(-1, 0.0);
+        }
         output_ << "# fixed molecular COM average v1\nsamples " << count_
                 << "\nskip_steps " << skip_ << "\nstride " << stride_
                 << "\nbeads " << forceSum_.size() / DIM << '\n';
@@ -399,6 +438,61 @@ public:
     }
 
 private:
+    static constexpr uint64_t c_accumulationBlockSize = 256;
+
+    void checkFinite(const char* quantity,
+                     size_t      component,
+                     double      value,
+                     int64_t     relativeStep,
+                     double      time) const
+    {
+        if (!std::isfinite(value))
+        {
+            gmx_fatal(FARGS,
+                      "Fixed-COM %s is non-finite at relative step %" PRId64
+                      ", time %.17g ps, component %zu.",
+                      quantity,
+                      relativeStep,
+                      time,
+                      component);
+        }
+    }
+
+    void flushBlock(int64_t relativeStep, double time)
+    {
+        for (size_t i = 0; i < forceSum_.size(); ++i)
+        {
+            const double value = forceSum_[i] + forceBlockSum_[i];
+            if (!std::isfinite(value))
+            {
+                gmx_fatal(FARGS,
+                          "Fixed-COM molecular force accumulation became non-finite at "
+                          "relative step %" PRId64 ", time %.17g ps, component %zu.",
+                          relativeStep,
+                          time,
+                          i);
+            }
+            forceSum_[i]      = value;
+            forceBlockSum_[i] = 0.0;
+        }
+        for (size_t i = 0; i < virialSum_.size(); ++i)
+        {
+            const double value = virialSum_[i] + virialBlockSum_[i];
+            if (!std::isfinite(value))
+            {
+                gmx_fatal(FARGS,
+                          "Fixed-COM force virial accumulation became non-finite at "
+                          "relative step %" PRId64 ", time %.17g ps, component %zu.",
+                          relativeStep,
+                          time,
+                          i);
+            }
+            virialSum_[i]      = value;
+            virialBlockSum_[i] = 0.0;
+        }
+        blockCount_ = 0;
+    }
+
     static int64_t readInteger(const char* name, int64_t fallback, int64_t minimum)
     {
         const char* text = std::getenv(name);
@@ -419,9 +513,12 @@ private:
     const gmx_mtop_t& topology_;
     int64_t skip_ = 0, stride_ = 1;
     uint64_t count_ = 0;
+    uint64_t blockCount_ = 0;
     std::vector<float> values_;
     std::vector<double> forceSum_;
+    std::vector<double> forceBlockSum_;
     std::array<double, DIM * DIM> virialSum_{};
+    std::array<double, DIM * DIM> virialBlockSum_{};
     std::ofstream output_, virialOutput_;
 };
 
