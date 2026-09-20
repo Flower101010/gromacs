@@ -63,7 +63,9 @@ for repo_file in /etc/yum.repos.d/*.repo; do
         "${repo_file}"
 done
 yum clean all >/dev/null
-yum install -y \
+# The image's optional SCLo software repository is stale and is not needed
+# for devtoolset; only the SCLo-RH repository is required below.
+yum --disablerepo=centos-sclo-sclo install -y \
     bzip2 curl file git gzip make perl tar wget xz zlib-devel \
     devtoolset-11-gcc devtoolset-11-gcc-c++
 
